@@ -293,7 +293,7 @@ ngx_http_req_pass_handler(ngx_http_request_t *r)
 
     } else {
 
-        if (ctx->count > rpcf->count) {
+        if (ctx->count >= rpcf->count) {
             over = 1;
         } else {
             ctx->count++;
