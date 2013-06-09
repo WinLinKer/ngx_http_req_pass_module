@@ -270,7 +270,7 @@ static ngx_int_t
 ngx_http_req_pass_handler(ngx_http_request_t *r)
 {
     ngx_flag_t                  over;
-    ngx_time_t                 *tp;
+    struct timeval              tv;
     ngx_http_req_pass_conf_t   *rpcf;
     ngx_http_req_pass_shctx_t  *ctx;
 
@@ -279,17 +279,19 @@ ngx_http_req_pass_handler(ngx_http_request_t *r)
         return NGX_DECLINED;
     }
 
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "request pass");
-
     over = 0;
     ctx = rpcf->shctx;
-    tp = ngx_timeofday();
+    ngx_gettimeofday(&tv);
 
     ngx_shmtx_lock(&rpcf->shpool->mutex);
 
-    if (ctx->time + rpcf->scale < (ngx_uint_t) tp->sec) {
+    if (ctx->time == 0) {
+        ctx->time = tv.tv_sec;
+    }
+
+    if (tv.tv_sec - ctx->time >= rpcf->scale) {
         ctx->count = 1;
-        ctx->time = tp->sec;
+        ctx->time = tv.tv_sec;
 
     } else {
 
@@ -305,6 +307,9 @@ ngx_http_req_pass_handler(ngx_http_request_t *r)
     if (over) {
         return ngx_http_req_pass_over(r, &rpcf->action);
     }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "request pass %ui", ctx->count);
 
     return NGX_DECLINED;
 }
