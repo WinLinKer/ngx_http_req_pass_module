@@ -8,6 +8,7 @@
 
 typedef struct {
     ngx_uint_t                  count;
+    ngx_uint_t                  time;
 } ngx_http_req_pass_shctx_t;
 
 
@@ -31,12 +32,14 @@ static ngx_int_t ngx_http_req_pass_init_shm_zone(ngx_shm_zone_t *shm_zone,
     void *data);
 static ngx_int_t ngx_http_req_pass_get_shm_name(ngx_str_t *shm_name,
     ngx_pool_t *pool, ngx_uint_t generation);
+static ngx_int_t ngx_http_req_pass_over(ngx_http_request_t *r,
+    ngx_str_t *action);
 
 
 static ngx_command_t  ngx_http_req_pass_commands[] = {
 
     { ngx_string("req_pass"),
-      NGX_HTTP_LOC_CONF|NGX_CONF_TAKE2,
+      NGX_HTTP_LOC_CONF|NGX_CONF_TAKE12,
       ngx_http_req_pass_set,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
@@ -194,10 +197,6 @@ ngx_http_req_pass_set(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return "r/s | r/m is error";
     }
 
-    if (action.len <= 0) {
-        return "action is error";
-    }
-
     rpcf->enable = 1;
     rpcf->count = count;
     rpcf->scale = scale;
@@ -221,6 +220,8 @@ ngx_http_req_pass_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
     if (sh == NULL) {
         return NGX_ERROR;
     }
+
+    ngx_memzero(sh, sizeof(ngx_http_req_pass_shctx_t));
 
     rpcf->shctx = sh;
     rpcf->shpool = shpool;
@@ -256,6 +257,10 @@ ngx_http_req_pass_merge_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_http_req_pass_conf_t *conf = child;
 
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
+    ngx_conf_merge_uint_value(conf->count, prev->count, 0);
+    ngx_conf_merge_uint_value(conf->scale, prev->scale, 0);
+    ngx_conf_merge_ptr_value(conf->shpool, prev->shpool, NULL);
+    ngx_conf_merge_ptr_value(conf->shctx, prev->shctx, NULL);
 
     return NGX_CONF_OK;
 }
@@ -264,7 +269,10 @@ ngx_http_req_pass_merge_conf(ngx_conf_t *cf, void *parent, void *child)
 static ngx_int_t
 ngx_http_req_pass_handler(ngx_http_request_t *r)
 {
-    ngx_http_req_pass_conf_t  *rpcf;
+    ngx_flag_t                  over;
+    ngx_time_t                 *tp;
+    ngx_http_req_pass_conf_t   *rpcf;
+    ngx_http_req_pass_shctx_t  *ctx;
 
     rpcf = ngx_http_get_module_loc_conf(r, ngx_http_req_pass_module);
     if (!rpcf->enable) {
@@ -273,7 +281,51 @@ ngx_http_req_pass_handler(ngx_http_request_t *r)
 
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "request pass");
 
+    over = 0;
+    ctx = rpcf->shctx;
+    tp = ngx_timeofday();
+
+    ngx_shmtx_lock(&rpcf->shpool->mutex);
+
+    if (ctx->time + rpcf->scale < (ngx_uint_t) tp->sec) {
+        ctx->count = 1;
+        ctx->time = tp->sec;
+
+    } else {
+
+        if (ctx->count > rpcf->count) {
+            over = 1;
+        } else {
+            ctx->count++;
+        }
+    }
+
+    ngx_shmtx_unlock(&rpcf->shpool->mutex);
+
+    if (over) {
+        return ngx_http_req_pass_over(r, &rpcf->action);
+    }
+
     return NGX_DECLINED;
+}
+
+
+static ngx_int_t
+ngx_http_req_pass_over(ngx_http_request_t *r, ngx_str_t *action)
+{
+    if (action->len == 0) {
+        return NGX_HTTP_SERVICE_UNAVAILABLE;
+    }
+
+    if (action->data[0] == '@') {
+        (void) ngx_http_named_location(r, action);
+
+    } else {
+        (void) ngx_http_internal_redirect(r, action, &r->args);
+    }
+
+    ngx_http_finalize_request(r, NGX_DONE);
+    return NGX_DONE;
 }
 
 
