@@ -3,8 +3,21 @@
 #include <ngx_http.h>
 
 
+#define NGX_HTTP_REQ_PASS_SHM_NAME_LEN 256
+
+
 typedef struct {
-    ngx_flag_t     enable;
+    ngx_uint_t                  count;
+} ngx_http_req_pass_shctx_t;
+
+
+typedef struct {
+    ngx_flag_t                  enable;
+    ngx_uint_t                  count;
+    ngx_uint_t                  scale;
+    ngx_str_t                   action;
+    ngx_slab_pool_t            *shpool;
+    ngx_http_req_pass_shctx_t  *shctx;
 } ngx_http_req_pass_conf_t;
 
 
@@ -14,6 +27,10 @@ static char *ngx_http_req_pass_merge_conf(ngx_conf_t *cf, void *parent,
 static ngx_int_t ngx_http_req_pass_init(ngx_conf_t *cf);
 static char *ngx_http_req_pass_set(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static ngx_int_t ngx_http_req_pass_init_shm_zone(ngx_shm_zone_t *shm_zone,
+    void *data);
+static ngx_int_t ngx_http_req_pass_get_shm_name(ngx_str_t *shm_name,
+    ngx_pool_t *pool, ngx_uint_t generation);
 
 
 static ngx_command_t  ngx_http_req_pass_commands[] = {
@@ -60,6 +77,9 @@ ngx_module_t  ngx_http_req_pass_module = {
 };
 
 
+static ngx_uint_t ngx_http_req_pass_shm_generation = 0;
+
+
 static void *
 ngx_http_req_pass_create_conf(ngx_conf_t *cf)
 {
@@ -71,6 +91,14 @@ ngx_http_req_pass_create_conf(ngx_conf_t *cf)
     }
 
     rpcf->enable = NGX_CONF_UNSET;
+    rpcf->count = NGX_CONF_UNSET_UINT;
+    rpcf->scale = NGX_CONF_UNSET_UINT;
+    rpcf->shpool = NGX_CONF_UNSET_PTR;
+    rpcf->shctx = NGX_CONF_UNSET_PTR;
+
+    /* set by pcalloc
+       rpcf->action = { NULL }
+     */
 
     return rpcf;
 }
@@ -81,9 +109,143 @@ ngx_http_req_pass_set(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_http_req_pass_conf_t *rpcf = conf;
 
+    u_char          *p;
+    size_t           len;
+    ngx_str_t        shm_name, action, s, *value;
+    ngx_int_t        count, scale;
+    ngx_uint_t       i;
+    ngx_shm_zone_t  *shm_zone;
+
+
+    value = cf->args->elts;
+    ngx_str_null(&action);
+
+    count = 0;
+    scale = 0;
+
+    for (i = 1; i < cf->args->nelts; i++) {
+
+        if (ngx_strncmp(value[i].data, "rate=", 5) == 0) {
+
+            len = value[i].len;
+            p = value[i].data + len - 3;
+
+            if (ngx_strncmp(p, "r/s", 3) == 0) {
+                scale = 1;
+                len -= 3;
+
+            } else if (ngx_strncmp(p, "r/m", 3) == 0) {
+                scale = 60;
+                len -= 3;
+            }
+
+            s.len = value[i].len - 5;
+            s.data = value[i].data + 5;
+
+            count = ngx_atoi(value[i].data + 5, len - 5);
+            if (count <= NGX_ERROR) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "invalid rate \"%V\" %V %i",
+                                   &value[i], &s, count);
+                return NGX_CONF_ERROR;
+            }
+
+            continue;
+        }
+
+        if (ngx_strncmp(value[i].data, "action=", 7) == 0) {
+
+            s.len = value[i].len - 7;
+            s.data = value[i].data + 7;
+
+            if (s.len < 2 || (s.data[0] != '@' && s.data[0] != '/')) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "invalid action \"%V\"", &value[i]);
+                return NGX_CONF_ERROR;
+            }
+
+            action = s;
+
+            continue;
+        }
+    }
+
+    ngx_http_req_pass_shm_generation++;
+
+    if (ngx_http_req_pass_get_shm_name(&shm_name, cf->pool,
+                                       ngx_http_req_pass_shm_generation)
+        != NGX_OK)
+    {
+        return NGX_CONF_ERROR;
+    }
+
+    shm_zone = ngx_shared_memory_add(cf, &shm_name,
+                                     ngx_pagesize * 8
+                                     + sizeof(ngx_http_req_pass_shctx_t),
+                                     &ngx_http_req_pass_module);
+    if (shm_zone == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    shm_zone->data = rpcf;
+    shm_zone->init = ngx_http_req_pass_init_shm_zone;
+
+    if (count <=0 || scale <=0 ) {
+        return "r/s | r/m is error";
+    }
+
+    if (action.len <= 0) {
+        return "action is error";
+    }
+
     rpcf->enable = 1;
+    rpcf->count = count;
+    rpcf->scale = scale;
+    rpcf->action = action;
 
     return NGX_CONF_OK;
+}
+
+
+static ngx_int_t
+ngx_http_req_pass_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
+{
+    ngx_slab_pool_t            *shpool;
+    ngx_http_req_pass_conf_t   *rpcf;
+    ngx_http_req_pass_shctx_t  *sh;
+
+    rpcf = shm_zone->data;
+    shpool = (ngx_slab_pool_t *) shm_zone->shm.addr;
+
+    sh = ngx_slab_alloc(shpool, sizeof(ngx_http_req_pass_shctx_t));
+    if (sh == NULL) {
+        return NGX_ERROR;
+    }
+
+    rpcf->shctx = sh;
+    rpcf->shpool = shpool;
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_req_pass_get_shm_name(ngx_str_t *shm_name, ngx_pool_t *pool,
+    ngx_uint_t generation)
+{
+    u_char  *last;
+
+    shm_name->data = ngx_palloc(pool, NGX_HTTP_REQ_PASS_SHM_NAME_LEN);
+    if (shm_name->data == NULL) {
+        return NGX_ERROR;
+    }
+
+    last = ngx_snprintf(shm_name->data, NGX_HTTP_REQ_PASS_SHM_NAME_LEN,
+                        "%s#%ui", "ngx_http_req_pass_module", generation);
+
+    shm_name->len = last - shm_name->data;
+
+    return NGX_OK;
 }
 
 
