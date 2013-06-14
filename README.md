@@ -3,8 +3,6 @@ This module can be used to limit the requests in one second or minute. It's not 
 
 ### Config Example
 
-file: conf/nginx.conf
-
     daemon off;
     error_log logs/error.log debug;
 
