@@ -13,7 +13,7 @@ use Test::Nginx;
 
 my $NGINX = defined $ENV{TEST_NGINX_BINARY} ? $ENV{TEST_NGINX_BINARY}
         : '../nginx/objs/nginx';
-my $t = Test::Nginx->new()->plan(3);
+my $t = Test::Nginx->new()->plan(7);
 
 sub mhttp_get($;$;$;%) {
     my ($url, $host, $port, %extra) = @_;
@@ -107,6 +107,12 @@ http
         location /punish {
             echo punish;
         }
+
+        location /2 {
+            req_pass rate=2r/s action=/punish;
+            echo ok;
+        }
+
     }
 }
 
@@ -120,6 +126,12 @@ like(mhttp_get('/', 'localhost', 8080), qr/ok/m, '');
 like(mhttp_get('/', 'localhost', 8080), qr/punish/m, '');
 sleep(1);
 like(mhttp_get('/', 'localhost', 8080), qr/ok/m, '');
+
+like(mhttp_get('/2', 'localhost', 8080), qr/ok/m, '');
+like(mhttp_get('/2', 'localhost', 8080), qr/ok/m, '');
+like(mhttp_get('/2', 'localhost', 8080), qr/punish/m, '');
+sleep(1);
+like(mhttp_get('/2', 'localhost', 8080), qr/ok/m, '');
 
 
 ###############################################################################
